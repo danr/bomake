@@ -18,5 +18,5 @@ setup(
     python_requires='>=3.7',
     license='MIT',
     install_requires=requirements.split(),
-    entry_points={'console_scripts': console_scripts.split()}
+    entry_points={'console_scripts': console_scripts.split()},
 )

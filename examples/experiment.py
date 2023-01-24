@@ -12,7 +12,6 @@ import time
 
 
 def first():
-
     @bo
     def x(a: int, b: int) -> int:
         print('x', a, b)
@@ -21,23 +20,19 @@ def first():
         else:
             return a + b
 
-
     @bo
     def h(p: Path):
         print('evaluating', p, p.read_text())
         return p.read_text().upper()
 
-
     for i in range(4):
         print(x(i, i))
-
 
     p = Path('test.tmp')
     p.write_text('example')
     print(h(p))
     p.write_text('example2')
     print(h(p))
-
 
 
 @bo
@@ -47,7 +42,9 @@ def csv_to_parquet(p: Path, **kwargs: Any) -> Path:
     df.to_parquet(pq)
     return pq
 
+
 read_parquet = bo(pd.read_parquet)
+
 
 def second():
     with bo.timeit('csv_to_parquet'):
@@ -57,9 +54,9 @@ def second():
             df = read_parquet(pq)
         # print(df.columns)
 
+
 first()
 second()
 
 bo.stats()
 bo.dump()
-

@@ -1,16 +1,15 @@
 from __future__ import annotations
 from typing import *
 from dataclasses import *
-from types import FunctionType, CellType, MethodType, CodeType
+from types import FunctionType, CodeType
 import pickle
 import sqlite3
 import functools
 from datetime import datetime
 from pathlib import Path
-import hashlib
 import time
 from contextlib import contextmanager
-import metrohash # type: ignore
+import metrohash  # type: ignore
 
 
 A = TypeVar('A')
@@ -37,28 +36,32 @@ DictMark = Marker('dict')
 
 def replace(x: Any) -> Any:
     fns: dict[Any, Any] = {}
+
     def go(x: Any) -> Any:
         if is_function(x):
             repr = function_repr(x)
             if repr not in fns:
                 fns[repr] = ...
-                fns[repr] = go((
-                    x.__code__.co_name,
-                    x.__code__.co_consts,
-                    x.__code__.co_code,
-                    [getattr(c, 'cell_contents', None) for c in x.__closure__ or []],
-                    getattr(x, '__self__', None),
-                ))
+                fns[repr] = go(
+                    (
+                        x.__code__.co_consts,
+                        [
+                            getattr(c, 'cell_contents', None)
+                            for c in x.__closure__ or []
+                        ],
+                        getattr(x, '__self__', None),
+                    )
+                )
             return (FunctionMark, *repr)
         elif type(x) in (tuple, set, list, frozenset):
             return (
                 Marker(str(type(x))),
-                *type(x)(map(go, x))
+                *type(x)(map(go, x)),
             )
         elif type(x) == dict:
             return (
                 DictMark,
-                *((go(k), go(v)) for k, v in sorted(x.items()))
+                *((go(k), go(v)) for k, v in sorted(x.items())),
             )
         elif isinstance(x, Path):
             return x.read_bytes()
@@ -67,10 +70,11 @@ def replace(x: Any) -> Any:
         elif is_dataclass(x):
             return (
                 Marker(x.__class__.__qualname__),
-                *((f.name, go(getattr(x, f.name))) for f in fields(x))
+                *((f.name, go(getattr(x, f.name))) for f in fields(x)),
             )
         else:
             return x
+
     return go(x), list(sorted(fns.items()))
 
 
@@ -114,11 +118,13 @@ schema = '''
 @dataclass(frozen=True)
 class DB:
     conn: sqlite3.Connection
+
     def insert(self, table_name: str, data: dict[str, Any]):
         colnames = ','.join(data.keys())
         qstmarks = ','.join('?' for _ in data.keys())
-        self.conn.execute(
-            f'insert into {table_name}({colnames}) values ({qstmarks})', [*data.values()]
+        return self.conn.execute(
+            f'insert into {table_name}({colnames}) values ({qstmarks})',
+            [*data.values()],
         )
 
     def select(self, table_name: str, exprs: str, **where: Any) -> sqlite3.Cursor:
@@ -140,7 +146,7 @@ class DB:
         return self.conn.execute(
             sql,
             [*data.values(), *where.values()],
-        ).fetchall()
+        )
 
 
 @dataclass
@@ -159,27 +165,38 @@ class Bo:
                 with self.timeit('digest'):
                     arg_digest = digest((f, args, kwargs))
                 atime = datetime.now().timestamp()
-                res_pickles = self.db.select('data', 'res_pickle', arg_digest=arg_digest).fetchall()
+                res_pickles = self.db.select(
+                    'data', 'res_pickle', arg_digest=arg_digest
+                ).fetchall()
                 if res_pickles:
                     (res_pickle,), *_ = res_pickles
                     with Bo.timeit('unpickle'):
                         res = pickle.loads(res_pickle)
                     with self.timeit('update db'):
-                        self.db.update('atimes', dict(atime=atime), arg_digest=arg_digest)
+                        self.db.update(
+                            'atimes', dict(atime=atime), arg_digest=arg_digest
+                        )
                     return res
                 else:
                     with self.timeit('get result'):
                         res = f(*args, **kwargs)
                     with self.timeit('insert into db'):
-                        self.db.insert('data', dict(
-                            arg_digest=arg_digest,
-                            res_pickle=pickle.dumps(res),
-                        ))
-                        self.db.insert('atimes', dict(
-                            arg_digest=arg_digest,
-                            atime=atime,
-                        ))
+                        self.db.insert(
+                            'data',
+                            dict(
+                                arg_digest=arg_digest,
+                                res_pickle=pickle.dumps(res),
+                            ),
+                        )
+                        self.db.insert(
+                            'atimes',
+                            dict(
+                                arg_digest=arg_digest,
+                                atime=atime,
+                            ),
+                        )
                     return res
+
         return F
 
     def dump(self):
@@ -189,19 +206,18 @@ class Bo:
         ):
             print(row)
 
-
     def stats(self):
         print(
             'rows:',
             len(list(self.db.select('data', 'rowid'))),
             'size:',
-            self.db.select('data', 'sum(length(res_pickle))').fetchone()[0]
+            self.db.select('data', 'sum(length(res_pickle))').fetchone()[0],
         )
 
     depth: ClassVar[int] = 0
 
     @classmethod
-    def timeit(cls, desc: str=''):
+    def timeit(cls, desc: str = ''):
         # The inferred type for the decorated function is wrong hence this wrapper to get the correct type
 
         @contextmanager
@@ -215,6 +231,3 @@ class Bo:
                 print(' ' * cls.depth + f'{T/1e6:.1f}ms {desc}')
 
         return worker()
-
-
-
