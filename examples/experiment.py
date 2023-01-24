@@ -17,7 +17,7 @@ def first():
     def x(a: int, b: int) -> int:
         print('x', a, b)
         if a > 1:
-            return 1 + int.__add__(a - 1, b + 1)
+            return 1 + x(a - 1, b + 1)
         else:
             return a + b
 
@@ -49,15 +49,16 @@ def csv_to_parquet(p: Path, **kwargs: Any) -> Path:
 
 read_parquet = bo(pd.read_parquet)
 
-def snd():
-    pq = csv_to_parquet(Path('./examples/tox.csv'), delimiter=';')
+def second():
+    with bo.timeit('csv_to_parquet'):
+        pq = csv_to_parquet(Path('./examples/tox.csv'), delimiter=';')
     for i in range(2):
         with bo.timeit('read_parquet'):
             df = read_parquet(pq)
         # print(df.columns)
 
 first()
-snd()
+second()
 
 bo.stats()
 bo.dump()
