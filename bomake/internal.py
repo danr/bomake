@@ -11,35 +11,26 @@ import time
 from contextlib import contextmanager
 import metrohash  # type: ignore
 
-
 A = TypeVar('A')
 P = ParamSpec('P')
 R = TypeVar('R')
-
 
 def is_function(f: Any) -> TypeGuard[FunctionType]:
     return isinstance(getattr(f, '__code__', None), CodeType)
 
 
-def function_repr(f: FunctionType) -> tuple[str, bytes]:
-    return (f.__code__.co_name, f.__code__.co_code)
+def code_repr(f: CodeType) -> tuple[str, bytes]:
+    return (f.co_name, f.co_code)
 
 
-@dataclass(frozen=True, slots=True)
-class Marker:
-    mark: str
-
-
-FunctionMark = Marker('function')
-DictMark = Marker('dict')
-
-
-def replace(x: Any) -> Any:
+def normalize(x: Any) -> Any:
     fns: dict[Any, Any] = {}
 
     def go(x: Any) -> Any:
-        if is_function(x):
-            repr = function_repr(x)
+        if isinstance(x, CodeType):
+            return code_repr(x)
+        elif is_function(x):
+            repr = code_repr(x.__code__)
             if repr not in fns:
                 fns[repr] = ...
                 fns[repr] = go(
@@ -50,26 +41,27 @@ def replace(x: Any) -> Any:
                             for c in x.__closure__ or []
                         ],
                         getattr(x, '__self__', None),
+                        getattr(x, '__defaults__', None),
                     )
                 )
-            return (FunctionMark, *repr)
+            return ('fn', *repr)
         elif type(x) in (tuple, set, list, frozenset):
             return (
-                Marker(str(type(x))),
+                f'{type(x)}',
                 *type(x)(map(go, x)),
             )
         elif type(x) == dict:
             return (
-                DictMark,
+                'dict',
                 *((go(k), go(v)) for k, v in sorted(x.items())),
             )
         elif isinstance(x, Path):
             return x.read_bytes()
         elif isinstance(x, Bo):
-            return (Marker('Bo'), x.path)
+            return ('bo', x.path)
         elif is_dataclass(x):
             return (
-                Marker(x.__class__.__qualname__),
+                f'data {x.__class__.__qualname__}',
                 *((f.name, go(getattr(x, f.name))) for f in fields(x)),
             )
         else:
@@ -78,37 +70,41 @@ def replace(x: Any) -> Any:
     return go(x), list(sorted(fns.items()))
 
 
-def digest(x: Any) -> str:
-    with Bo.timeit('replace'):
-        repr = replace(x)
+def calculate_digest(x: Any) -> str:
+    with Bo.timeit('normalize'):
+        repr = normalize(x)
     with Bo.timeit('pkl'):
-        pkl = pickle.dumps(repr)
+        try:
+            pkl = pickle.dumps(repr)
+        except:
+            print('Cannot pickle:', repr)
+            raise
     with Bo.timeit('hash'):
         return hex(cast(Any, metrohash).hash128_int(pkl))
 
 
 schema = '''
     create table if not exists data(
-        arg_digest text,
-        res_pickle blob
+        digest text,
+        binary blob
     );
     create table if not exists atimes(
-        arg_digest text,
+        digest text,
         atime real
     );
     create view if not exists bo as
         select
-            data.arg_digest                                  as arg_digest,
+            data.digest                                      as digest,
             datetime(atimes.atime, 'unixepoch', 'localtime') as atime,
-            data.res_pickle                                  as res_pickle
+            data.binary                                      as binary
         from
             data, atimes
         where
-            data.arg_digest = atimes.arg_digest
+            data.digest = atimes.digest
         order by
             atimes.atime
     ;
-    -- create index if not exists bo_arg_digest on bo(arg_digest);
+    -- create index if not exists bo_arg_digest on bo(digest);
     pragma journal_mode = WAL;
     pragma wal_autocheckpoint = 0;
     pragma synchronous = OFF;
@@ -148,50 +144,91 @@ class DB:
             [*data.values(), *where.values()],
         )
 
+    def delete(self, table_name: str, **where: Any):
+        if not where:
+            where = {'1': 1}
+        sql = f'delete from {table_name} where '
+        sql = sql + ' and '.join(f'{k} = ?' for k in where.keys())
+        return self.conn.execute(
+            sql,
+            [*where.values()],
+        )
+
+class Serializer:
+    def dumps(self, object: Any) -> bytes:
+        return pickle.dumps(object)
+
+    def loads(self, binary: bytes) -> Any:
+        return pickle.loads(binary)
 
 @dataclass
 class Bo:
     path: str = 'bo.db'
-    db: DB = cast(Any, None)
+    _db: DB = cast(Any, None)
+    extra_state: Callable[[], Any] = field(default_factory=lambda: lambda: None)
+    serializer: Serializer = field(default_factory=lambda: Serializer())
 
-    def __post_init__(self):
-        self.db = DB(sqlite3.connect(self.path, isolation_level=None))
-        self.db.conn.executescript(schema)
+    Serializer: ClassVar = Serializer
+
+    @property
+    def db(self):
+        if cast(Any, self._db) is None:
+            self._db = DB(sqlite3.connect(self.path, isolation_level=None, check_same_thread=False))
+            self._db.conn.executescript(schema)
+        return self._db
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *err: Any):
+        self.close()
+
+    def close(self):
+        self.db.conn.close()
+
+    def with_extra_state(self, k: Callable[[], Any]) -> Bo:
+        return replace(self, extra_state=lambda: (self.extra_state(), k()))
+
+    def with_serializer(self, serializer: Serializer) -> Bo:
+        return replace(self, serializer=serializer)
 
     def __call__(self, f: Callable[P, R]) -> Callable[P, R]:
         @functools.wraps(f)
         def F(*args: P.args, **kwargs: P.kwargs):
-            with self.timeit('call'):
+            with self.timeit(f'call'):
                 with self.timeit('digest'):
-                    arg_digest = digest((f, args, kwargs))
+                    extra_state = (self.extra_state(), self.serializer.__class__.__qualname__)
+                    digest = calculate_digest(((f, args, kwargs), extra_state))
                 atime = datetime.now().timestamp()
-                res_pickles = self.db.select(
-                    'data', 'res_pickle', arg_digest=arg_digest
+                res_binaries = self.db.select(
+                    'data', 'binary', digest=digest
                 ).fetchall()
-                if res_pickles:
-                    (res_pickle,), *_ = res_pickles
-                    with Bo.timeit('unpickle'):
-                        res = pickle.loads(res_pickle)
+                if res_binaries:
+                    (binary,), *_ = res_binaries
+                    with Bo.timeit('loads'):
+                        res = self.serializer.loads(binary)
                     with self.timeit('update db'):
                         self.db.update(
-                            'atimes', dict(atime=atime), arg_digest=arg_digest
+                            'atimes', dict(atime=atime), digest=digest
                         )
                     return res
                 else:
                     with self.timeit('get result'):
                         res = f(*args, **kwargs)
+                    with self.timeit('dumps'):
+                        binary = self.serializer.dumps(res)
                     with self.timeit('insert into db'):
                         self.db.insert(
                             'data',
                             dict(
-                                arg_digest=arg_digest,
-                                res_pickle=pickle.dumps(res),
+                                digest=digest,
+                                binary=binary,
                             ),
                         )
                         self.db.insert(
                             'atimes',
                             dict(
-                                arg_digest=arg_digest,
+                                digest=digest,
                                 atime=atime,
                             ),
                         )
@@ -202,7 +239,7 @@ class Bo:
     def dump(self):
         for row in self.db.select(
             'bo',
-            'arg_digest, atime, length(res_pickle)',
+            'digest, atime, length(binary)',
         ):
             print(row)
 
@@ -211,8 +248,12 @@ class Bo:
             'rows:',
             len(list(self.db.select('data', 'rowid'))),
             'size:',
-            self.db.select('data', 'sum(length(res_pickle))').fetchone()[0],
+            self.db.select('data', 'sum(length(binary))').fetchone()[0],
         )
+
+    def clear(self):
+        self.db.delete('data')
+        self.db.delete('atimes')
 
     depth: ClassVar[int] = 0
 
