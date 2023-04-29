@@ -1,7 +1,6 @@
 from setuptools import setup
 
 requirements = '''
-    metrohash
 '''
 
 console_scripts = '''
