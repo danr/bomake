@@ -18,30 +18,43 @@ R = TypeVar('R')
 def is_function(f: Any) -> TypeGuard[FunctionType]:
     return isinstance(getattr(f, '__code__', None), CodeType)
 
-
-def code_repr(f: CodeType) -> tuple[str, bytes]:
-    return (f.co_name, f.co_code)
-
-
 def normalize(x: Any) -> Any:
     fns: dict[Any, Any] = {}
 
     def go(x: Any) -> Any:
         if isinstance(x, CodeType):
-            return code_repr(x)
+            return go((
+                'code',
+                x.co_argcount,
+                x.co_cellvars,
+                x.co_code,
+                x.co_consts,
+                x.co_flags,
+                x.co_freevars,
+                x.co_kwonlyargcount,
+                x.co_name,
+                x.co_names,
+                x.co_nlocals,
+                x.co_posonlyargcount,
+                x.co_stacksize,
+                x.co_varnames,
+            ))
         elif is_function(x):
-            repr = code_repr(x.__code__)
+            code = x.__code__
+            repr = (code.co_name, code.co_code, code.co_filename)
+            x.__kwdefaults__
             if repr not in fns:
                 fns[repr] = ...
                 fns[repr] = go(
                     (
-                        x.__code__.co_consts,
+                        code,
                         [
                             getattr(c, 'cell_contents', None)
                             for c in x.__closure__ or []
                         ],
                         getattr(x, '__self__', None),
                         getattr(x, '__defaults__', None),
+                        getattr(x, '__kwdefaults__', None),
                     )
                 )
             return ('fn', *repr)
@@ -71,15 +84,15 @@ def normalize(x: Any) -> Any:
 
 
 def calculate_digest(x: Any) -> str:
-    with Bo.timeit('normalize'):
+    # with self.timeit('normalize'):
         repr = normalize(x)
-    with Bo.timeit('pkl'):
+    # with self.timeit('pkl'):
         try:
             pkl = pickle.dumps(repr)
         except:
             print('Cannot pickle:', repr)
             raise
-    with Bo.timeit('hash'):
+    # with self.timeit('hash'):
         return hex(cast(Any, metrohash).hash128_int(pkl))
 
 
@@ -104,9 +117,8 @@ schema = '''
         order by
             atimes.atime
     ;
-    -- create index if not exists bo_arg_digest on bo(digest);
     pragma journal_mode = WAL;
-    pragma wal_autocheckpoint = 0;
+    pragma wal_autocheckpoint = 1000;
     pragma synchronous = OFF;
 '''
 
@@ -170,6 +182,8 @@ class Bo:
 
     Serializer: ClassVar = Serializer
 
+    digest = staticmethod(calculate_digest)
+
     @property
     def db(self):
         if cast(Any, self._db) is None:
@@ -195,7 +209,10 @@ class Bo:
     def __call__(self, f: Callable[P, R]) -> Callable[P, R]:
         @functools.wraps(f)
         def F(*args: P.args, **kwargs: P.kwargs):
-            with self.timeit(f'call'):
+            name = ' ' + f.__name__
+            if 'lambda' in name:
+                name = ''
+            with self.timeit(f'call{name}'):
                 with self.timeit('digest'):
                     extra_state = (self.extra_state(), self.serializer.__class__.__qualname__)
                     digest = calculate_digest(((f, args, kwargs), extra_state))
@@ -205,7 +222,7 @@ class Bo:
                 ).fetchall()
                 if res_binaries:
                     (binary,), *_ = res_binaries
-                    with Bo.timeit('loads'):
+                    with self.timeit('loads'):
                         res = self.serializer.loads(binary)
                     with self.timeit('update db'):
                         self.db.update(
@@ -255,20 +272,19 @@ class Bo:
         self.db.delete('data')
         self.db.delete('atimes')
 
-    depth: ClassVar[int] = 0
+    depth: int = 0
 
-    @classmethod
-    def timeit(cls, desc: str = ''):
+    def timeit(self, desc: str = ''):
         # The inferred type for the decorated function is wrong hence this wrapper to get the correct type
 
         @contextmanager
         def worker():
-            t0 = time.monotonic_ns()
-            cls.depth += 1
+            t0 = time.monotonic()
+            self.depth += 1
             yield
-            cls.depth -= 1
-            T = time.monotonic_ns() - t0
-            if 0 or cls.depth == 0:
-                print(' ' * cls.depth + f'{T/1e6:.1f}ms {desc}')
+            self.depth -= 1
+            T = time.monotonic() - t0
+            if self.depth == 0:
+                print(' ' * self.depth + f'{T * 1000: >7.1f}ms {desc}', flush=True)
 
         return worker()
